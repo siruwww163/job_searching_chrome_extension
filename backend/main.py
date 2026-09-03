@@ -81,12 +81,18 @@ def research_company(company: str):
     # 从不同角度搜索公司，而不是把所有问题塞进一个 query
     # --------------------------------------------------------
 
+    # queries = [
+    #     f'"{company}" official website company about headquarters founded',
+    #     f'"{company}" company size employees industry headquarters',
+    #     f'"{company}" staffing recruiting agency consulting jobs',
+    #     f'"{company}" careers jobs employer',
+    #     f'"{company}" company reviews scam legitimacy'
+    # ]
+    
     queries = [
-        f'"{company}" official website company about headquarters founded',
-        f'"{company}" company size employees industry headquarters',
-        f'"{company}" staffing recruiting agency consulting jobs',
-        f'"{company}" careers jobs employer',
-        f'"{company}" company reviews scam legitimacy'
+        f'"{company}" official website company size headquarters founded industry',
+        f'"{company}" staffing recruiting consulting aggregator employer jobs',
+        f'"{company}" legitimacy reviews company background'
     ]
 
 
@@ -182,20 +188,21 @@ Use this exact structure:
 
 {{
     "company": "{company}",
-    "overview": "",
+    # "overview": "",
     "company_type": "",
     "employer_type": "",
     "industry": "",
     "company_size": "",
-    "founded": "",
+    # "founded": "",
     "headquarters": "",
     "primary_base": "",
     "official_website": "",
-    "ownership": "",
+    # "ownership": "",
     "legitimacy_signal": "",
     "verification_confidence": "",
-    "why_this_classification": [],
-    "things_to_verify": []
+    # "why_this_classification": [],
+    # "things_to_verify": []
+    "warning": ""
 }}
 
 For employer_type, choose exactly one:
@@ -257,7 +264,7 @@ SOURCES:
 
     response = client.messages.create(
         model="claude-sonnet-5",
-        max_tokens=1500,
+        max_tokens=1000,
         messages=[
             {
                 "role": "user",
@@ -266,36 +273,56 @@ SOURCES:
         ]
     )
 
-    report_text = response.content[0].text
+    text_blocks = [
+        block.text
+        for block in response.content
+        if getattr(block, "type", None) == "text"
+    ]
+
+    report_text = "\n".join(text_blocks).strip()
 
 
     # --------------------------------------------------------
     # Step 6:
-    # 将 Claude 返回的 JSON 文本转换成 Python dictionary
+    # 清理 Claude 返回内容，并转换成 Python dictionary
     # --------------------------------------------------------
+    cleaned_report_text = report_text.strip()
+
+    # Claude 有时会把 JSON 包在 ```json ... ``` 里面
+    if cleaned_report_text.startswith("```json"):
+        cleaned_report_text = cleaned_report_text[7:]
+
+    elif cleaned_report_text.startswith("```"):
+        cleaned_report_text = cleaned_report_text[3:]
+
+    # 去掉最后的 ```
+    if cleaned_report_text.endswith("```"):
+        cleaned_report_text = cleaned_report_text[:-3]
+
+    cleaned_report_text = cleaned_report_text.strip()
+
 
     try:
-
-        report = json.loads(report_text)
+        report = json.loads(cleaned_report_text)
 
     except json.JSONDecodeError:
 
+        print("Claude returned invalid JSON:")
+        print(report_text)
+
         report = {
             "company": company,
-            "overview": "Could not parse AI response.",
-            "company_type": "",
+            "company_type": "Not clearly found",
             "employer_type": "Unknown",
-            "industry": "",
-            "company_size": "",
-            "founded": "",
-            "headquarters": "",
-            "primary_base": "",
-            "official_website": "",
-            "ownership": "",
+            "direct_employer": "Unclear",
+            "industry": "Not clearly found",
+            "company_size": "Not clearly found",
+            "headquarters": "Not clearly found",
+            "primary_base": "Not clearly found",
+            "official_website": "Not clearly found",
             "legitimacy_signal": "Insufficient Information",
             "verification_confidence": "Low",
-            "why_this_classification": [],
-            "things_to_verify": []
+            "warning": "Could not parse AI response."
         }
 
 
