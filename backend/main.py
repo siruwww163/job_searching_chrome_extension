@@ -3,18 +3,22 @@
 #
 # 功能：
 # 1. 接收 Chrome Extension 传来的公司名称
-# 2. 使用 Tavily 从多个角度搜索公司的公开信息
-# 3. 对搜索结果进行 URL 去重
-# 4. 将搜索结果交给 Claude 分析
-# 5. 判断公司类型、规模、所在地、Employer Type 和可信度
-# 6. 将结构化的公司背调结果返回给 Chrome Extension
+# 2. 优先检查 SQLite 本地缓存，避免重复调用 Tavily 和 Claude
+# 3. 没有缓存时，使用 Tavily 搜索公司的公开信息
+# 4. 使用 Claude 判断公司类型、规模、所在地和雇主类型
+# 5. 将研究结果和 Sources 保存到 SQLite
+# 6. 支持 refresh=true 强制重新搜索并更新旧记录
 #
-# 当前版本重点：
-# Company Identity + Employer Verification
+# SQLite 的作用：
+# - Popup 关闭后研究结果不会丢失
+# - 重复搜索同一公司不会重复消耗 API
+# - 如果旧结果不准确，可以通过 Refresh Research 重新搜索
 # ============================================================
 
 import os
 import json
+import sqlite3
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -24,10 +28,153 @@ from anthropic import Anthropic
 
 
 # ------------------------------------------------------------
-# 读取 .env 中的环境变量
+# 读取 .env
 # ------------------------------------------------------------
 
 load_dotenv()
+
+
+# ------------------------------------------------------------
+# SQLite 数据库路径
+#
+# 数据库会创建在 backend/company_cache.db
+# ------------------------------------------------------------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATABASE_PATH = os.path.join(
+    BASE_DIR,
+    "company_cache.db"
+)
+
+
+# ------------------------------------------------------------
+# 初始化 SQLite
+# ------------------------------------------------------------
+
+def initialize_database():
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_cache (
+                normalized_company TEXT PRIMARY KEY,
+                company_input TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                sources_json TEXT NOT NULL,
+                searched_at TEXT NOT NULL
+            )
+            """
+        )
+
+        connection.commit()
+
+
+initialize_database()
+
+
+# ------------------------------------------------------------
+# 公司名称标准化
+#
+# 当前先做最安全的处理：
+# 去掉首尾空格 + 转成小写
+#
+# 暂时不自动删除 Inc / LLC 等内容，
+# 避免错误地把不同公司合并成同一个缓存记录。
+# ------------------------------------------------------------
+
+def normalize_company_name(company: str) -> str:
+
+    return " ".join(
+        company.strip().lower().split()
+    )
+
+
+# ------------------------------------------------------------
+# 从 SQLite 获取缓存
+# ------------------------------------------------------------
+
+def get_cached_company(company: str):
+
+    normalized_company = normalize_company_name(company)
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+
+        connection.row_factory = sqlite3.Row
+
+        row = connection.execute(
+            """
+            SELECT
+                company_input,
+                report_json,
+                sources_json,
+                searched_at
+            FROM company_cache
+            WHERE normalized_company = ?
+            """,
+            (normalized_company,)
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return {
+        "report": json.loads(row["report_json"]),
+        "sources": json.loads(row["sources_json"]),
+        "searched_at": row["searched_at"],
+        "from_cache": True
+    }
+
+
+# ------------------------------------------------------------
+# 保存 / 更新 SQLite 缓存
+# ------------------------------------------------------------
+
+def save_company_cache(
+    company: str,
+    report: dict,
+    sources: list
+):
+
+    normalized_company = normalize_company_name(company)
+
+    searched_at = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    with sqlite3.connect(DATABASE_PATH) as connection:
+
+        connection.execute(
+            """
+            INSERT INTO company_cache (
+                normalized_company,
+                company_input,
+                report_json,
+                sources_json,
+                searched_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+
+            ON CONFLICT(normalized_company)
+            DO UPDATE SET
+                company_input = excluded.company_input,
+                report_json = excluded.report_json,
+                sources_json = excluded.sources_json,
+                searched_at = excluded.searched_at
+            """,
+            (
+                normalized_company,
+                company,
+                json.dumps(report),
+                json.dumps(sources),
+                searched_at
+            )
+        )
+
+        connection.commit()
+
+    return searched_at
 
 
 # ------------------------------------------------------------
@@ -36,8 +183,6 @@ load_dotenv()
 
 app = FastAPI()
 
-
-# 允许 Chrome Extension 调用本地 FastAPI
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -59,11 +204,12 @@ client = Anthropic(
 
 
 # ------------------------------------------------------------
-# 测试 Backend 是否正常运行
+# Backend 测试
 # ------------------------------------------------------------
 
 @app.get("/")
 def home():
+
     return {
         "message": "Company Research backend is running"
     }
@@ -71,34 +217,66 @@ def home():
 
 # ------------------------------------------------------------
 # 公司背调 API
+#
+# refresh=false:
+# 优先使用缓存
+#
+# refresh=true:
+# 忽略缓存，重新调用 Tavily + Claude
 # ------------------------------------------------------------
 
 @app.get("/research")
-def research_company(company: str):
+def research_company(
+    company: str,
+    refresh: bool = False
+):
+
+    company = company.strip()
+
 
     # --------------------------------------------------------
     # Step 1:
-    # 从不同角度搜索公司，而不是把所有问题塞进一个 query
+    # 如果不是 Refresh，先检查 SQLite
     # --------------------------------------------------------
 
-    # queries = [
-    #     f'"{company}" official website company about headquarters founded',
-    #     f'"{company}" company size employees industry headquarters',
-    #     f'"{company}" staffing recruiting agency consulting jobs',
-    #     f'"{company}" careers jobs employer',
-    #     f'"{company}" company reviews scam legitimacy'
-    # ]
-    
-    queries = [
-        f'"{company}" official website company size headquarters founded industry',
-        f'"{company}" staffing recruiting consulting aggregator employer jobs',
-        f'"{company}" legitimacy reviews company background'
-    ]
+    if not refresh:
+
+        cached_result = get_cached_company(company)
+
+        if cached_result is not None:
+
+            print(
+                f"Cache hit: {company}"
+            )
+
+            return cached_result
+
+
+    print(
+        f"Running new research: {company}"
+    )
 
 
     # --------------------------------------------------------
     # Step 2:
-    # 执行 Tavily 搜索并收集结果
+    # 两个 targeted Tavily searches
+    # --------------------------------------------------------
+
+    queries = [
+        (
+            f'"{company}" official website company LinkedIn '
+            f'headquarters employees industry'
+        ),
+        (
+            f'"{company}" employer staffing recruiting '
+            f'consulting aggregator legitimacy'
+        )
+    ]
+
+
+    # --------------------------------------------------------
+    # Step 3:
+    # Tavily 搜索 + URL 去重
     # --------------------------------------------------------
 
     sources = []
@@ -111,35 +289,51 @@ def research_company(company: str):
             max_results=3
         )
 
-        results = search_response.get("results", [])
+        results = search_response.get(
+            "results",
+            []
+        )
 
         for item in results:
 
-            url = item.get("url", "")
+            url = item.get(
+                "url",
+                ""
+            )
 
-            # URL 为空则跳过
             if not url:
                 continue
 
-            # 避免同一个网页重复出现
-            if any(source["url"] == url for source in sources):
+            if any(
+                source["url"] == url
+                for source in sources
+            ):
                 continue
 
             sources.append({
-                "title": item.get("title", ""),
+                "title": item.get(
+                    "title",
+                    ""
+                ),
                 "url": url,
-                "content": item.get("content", "")
+                "content": item.get(
+                    "content",
+                    ""
+                )
             })
 
 
     # --------------------------------------------------------
-    # Step 3:
-    # 将搜索结果整理成 Claude 可以阅读的文本
+    # Step 4:
+    # 整理 Sources 给 Claude
     # --------------------------------------------------------
 
     source_text = ""
 
-    for i, source in enumerate(sources, start=1):
+    for i, source in enumerate(
+        sources,
+        start=1
+    ):
 
         source_text += f"""
 SOURCE {i}
@@ -157,51 +351,48 @@ Content:
 
 
     # --------------------------------------------------------
-    # Step 4:
-    # 要求 Claude 根据搜索证据进行公司身份和雇主类型判断
+    # Step 5:
+    # Claude Prompt
     # --------------------------------------------------------
 
     prompt = f"""
-You are helping a job seeker verify a company before applying for a job.
+You are helping a job seeker quickly identify a company before applying.
 
 Company searched:
 {company}
 
-Your primary goal is to determine:
-
-1. What company is this?
-2. What does the company actually do?
-3. How large is the company?
-4. Where is the company headquartered and primarily based?
-5. Is it an actual operating employer?
-6. Is it a staffing or recruiting company?
-7. Is it an IT consulting or staff augmentation company?
-8. Does it resemble an ICC / IT consulting company?
-9. Is it primarily a job board, aggregator, or lead-generation website?
-10. Are there signs that a job seeker should verify it more carefully?
-
 Use ONLY the supplied web search evidence.
+
+The user wants a quick company verification result, not a long research report.
+
+Determine:
+
+1. What type of company is this?
+2. What industry is it in?
+3. Approximately how large is it?
+4. Where is it headquartered?
+5. What country is it primarily based in?
+6. Is it the likely direct employer?
+7. Is it a staffing/recruiting agency, consulting/staff augmentation
+   company, ICC, job board, aggregator, or another intermediary?
+8. Is there an important verification concern?
 
 Return valid JSON only.
 
-Use this exact structure:
+Use EXACTLY these fields:
 
 {{
     "company": "{company}",
-    # "overview": "",
     "company_type": "",
     "employer_type": "",
+    "direct_employer": "",
     "industry": "",
     "company_size": "",
-    # "founded": "",
     "headquarters": "",
     "primary_base": "",
     "official_website": "",
-    # "ownership": "",
     "legitimacy_signal": "",
     "verification_confidence": "",
-    # "why_this_classification": [],
-    # "things_to_verify": []
     "warning": ""
 }}
 
@@ -215,6 +406,14 @@ For employer_type, choose exactly one:
 - Lead Generation
 - Outsourcing Vendor
 - Unknown
+
+For direct_employer, choose exactly one:
+
+- Yes
+- Likely Yes
+- Likely No
+- No
+- Unclear
 
 For legitimacy_signal, choose exactly one:
 
@@ -230,26 +429,33 @@ For verification_confidence, choose exactly one:
 - Medium
 - Low
 
-Important rules:
+IMPORTANT RULES:
 
 - Do not invent information.
-- Do not assume that a small company is illegitimate.
-- Do not assume that a staffing or recruiting agency is illegitimate.
-- Distinguish company type from legitimacy.
-- Do not label a company a scam unless the supplied evidence strongly supports it.
-- Prefer official company sources and reputable third-party sources over social media posts.
-- If sources conflict, mention the conflict.
-- If company size is a range, preserve the range.
-- If an exact employee count cannot be verified, do not invent one.
-- For headquarters, distinguish headquarters from other office locations.
-- primary_base should identify the main country where the company appears to operate.
-- If an official website can be identified, return the full URL.
-- ownership should describe whether the company appears to be public, private, a subsidiary, or another identifiable ownership structure.
-- why_this_classification should contain 2 to 5 short evidence-based reasons.
-- things_to_verify should contain practical uncertainties a job seeker should check before applying.
-- If information cannot be determined, use "Not clearly found".
-- Do not include Markdown.
-- Return JSON only.
+- Do not assume a small company is illegitimate.
+- Do not assume a staffing or recruiting company is illegitimate.
+- Company legitimacy and direct-employer status are different questions.
+- Do not call something a scam without strong evidence.
+- Prefer official company sources and reputable company profiles.
+- Be cautious about similarly named companies.
+- Do not treat an unrelated company with a similar name as the same entity.
+- If sources disagree about company size, preserve the range and briefly note the conflict.
+- If sources disagree about headquarters, say the information conflicts.
+- Do not invent an exact employee count.
+- If information cannot be determined, return "Not clearly found".
+
+WARNING RULES:
+
+- warning must contain only ONE short sentence.
+- warning must be no more than 25 words.
+- Mention only the most important concern.
+- Do not provide a long explanation.
+- Do not provide recommendations or a paragraph.
+- If no meaningful concern exists, return:
+  "No major concern found."
+
+Return JSON only.
+Do not include Markdown.
 
 SOURCES:
 
@@ -258,8 +464,8 @@ SOURCES:
 
 
     # --------------------------------------------------------
-    # Step 5:
-    # Claude 阅读搜索结果并生成结构化公司背调报告
+    # Step 6:
+    # 调用 Claude
     # --------------------------------------------------------
 
     response = client.messages.create(
@@ -273,41 +479,77 @@ SOURCES:
         ]
     )
 
+
+    # --------------------------------------------------------
+    # Step 7:
+    # 只提取 Claude TextBlock
+    # --------------------------------------------------------
+
     text_blocks = [
         block.text
         for block in response.content
-        if getattr(block, "type", None) == "text"
+        if getattr(
+            block,
+            "type",
+            None
+        ) == "text"
     ]
 
-    report_text = "\n".join(text_blocks).strip()
+    report_text = "\n".join(
+        text_blocks
+    ).strip()
 
 
     # --------------------------------------------------------
-    # Step 6:
-    # 清理 Claude 返回内容，并转换成 Python dictionary
+    # Step 8:
+    # 清理 Markdown JSON fence
     # --------------------------------------------------------
+
     cleaned_report_text = report_text.strip()
 
-    # Claude 有时会把 JSON 包在 ```json ... ``` 里面
-    if cleaned_report_text.startswith("```json"):
-        cleaned_report_text = cleaned_report_text[7:]
+    if cleaned_report_text.startswith(
+        "```json"
+    ):
+        cleaned_report_text = (
+            cleaned_report_text[7:]
+        )
 
-    elif cleaned_report_text.startswith("```"):
-        cleaned_report_text = cleaned_report_text[3:]
+    elif cleaned_report_text.startswith(
+        "```"
+    ):
+        cleaned_report_text = (
+            cleaned_report_text[3:]
+        )
 
-    # 去掉最后的 ```
-    if cleaned_report_text.endswith("```"):
-        cleaned_report_text = cleaned_report_text[:-3]
+    if cleaned_report_text.endswith(
+        "```"
+    ):
+        cleaned_report_text = (
+            cleaned_report_text[:-3]
+        )
 
-    cleaned_report_text = cleaned_report_text.strip()
+    cleaned_report_text = (
+        cleaned_report_text.strip()
+    )
 
+
+    # --------------------------------------------------------
+    # Step 9:
+    # JSON parsing
+    # --------------------------------------------------------
 
     try:
-        report = json.loads(cleaned_report_text)
+
+        report = json.loads(
+            cleaned_report_text
+        )
 
     except json.JSONDecodeError:
 
-        print("Claude returned invalid JSON:")
+        print(
+            "Claude returned invalid JSON:"
+        )
+
         print(report_text)
 
         report = {
@@ -327,11 +569,55 @@ SOURCES:
 
 
     # --------------------------------------------------------
-    # Step 7:
-    # 返回给 Chrome Extension
+    # Step 10:
+    # 缺失字段默认值
+    # --------------------------------------------------------
+
+    defaults = {
+        "company": company,
+        "company_type": "Not clearly found",
+        "employer_type": "Unknown",
+        "direct_employer": "Unclear",
+        "industry": "Not clearly found",
+        "company_size": "Not clearly found",
+        "headquarters": "Not clearly found",
+        "primary_base": "Not clearly found",
+        "official_website": "Not clearly found",
+        "legitimacy_signal": "Insufficient Information",
+        "verification_confidence": "Low",
+        "warning": "No major concern found."
+    }
+
+    for key, default_value in defaults.items():
+
+        if (
+            key not in report
+            or report[key] is None
+            or report[key] == ""
+        ):
+            report[key] = default_value
+
+
+    # --------------------------------------------------------
+    # Step 11:
+    # 保存到 SQLite
+    # --------------------------------------------------------
+
+    searched_at = save_company_cache(
+        company=company,
+        report=report,
+        sources=sources
+    )
+
+
+    # --------------------------------------------------------
+    # Step 12:
+    # 返回给 Extension
     # --------------------------------------------------------
 
     return {
         "report": report,
-        "sources": sources
+        "sources": sources,
+        "searched_at": searched_at,
+        "from_cache": False
     }
