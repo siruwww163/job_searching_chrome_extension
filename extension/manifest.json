@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Company Research",
+  "version": "0.1.0",
+  "description": "Research companies while browsing job postings.",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": [],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*"
+  ]
+}

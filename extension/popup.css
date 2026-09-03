@@ -1,0 +1,27 @@
+body {
+    width: 350px;
+    padding: 16px;
+    font-family: Arial, sans-serif;
+}
+
+h2 {
+    margin-top: 0;
+}
+
+input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px;
+    margin-bottom: 10px;
+}
+
+button {
+    width: 100%;
+    padding: 10px;
+    cursor: pointer;
+}
+
+#result {
+    margin-top: 16px;
+    line-height: 1.4;
+}
